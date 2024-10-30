@@ -19,8 +19,10 @@ from . import endpoints
 
 class webull :
 
-    def __init__(self, region_code=None) :
-        self._session = requests.session()
+    def __init__(self, region_code=None, proxy=None):
+        self._session = requests.Session()
+        if proxy:
+            self._session.proxies.update(proxy)
         self._headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:99.0) Gecko/20100101 Firefox/99.0',
             'Accept': '*/*',
@@ -59,6 +61,12 @@ class webull :
         self.zone_var = 'dc_core_r001'
         self.timeout = 15
 
+    def check_proxy(self):
+        url = 'https://httpbin.org/ip'
+        response =  self._session.get(url)
+        print(f"Response from httpbin: {response.json()}")
+        return response.json()
+
     def _get_did(self, path=''):
         '''
         Makes a unique device id from a random uuid (uuid.uuid4).
@@ -81,7 +89,7 @@ class webull :
             pickle.dump(did, open(filename, 'wb'))
         return did
 
-    def _set_did(self, did, path=''):
+    def set_did(self, did, path=''):
         '''
         If your starting to use this package after webull's new image verification for login, you'll
         need to login from a browser to get your did file in order to login through this api. You can
@@ -319,30 +327,45 @@ class webull :
         '''
         headers = self.build_req_headers()
 
-        response = requests.get(self._urls.account_id(), headers=headers, timeout=self.timeout)
+        response = requests.get(self._urls.account_list(), headers=headers, timeout=self.timeout)
         result = response.json()
-        if result['success'] and len(result['data']) > 0 :
-            self.zone_var = str(result['data'][int(id)]['rzone'])
-            self._account_id = str(result['data'][int(id)]['secAccountId'])
+        if result.get('accountList') and id < len(result['accountList']) and result['accountList'][int(id)]['status'] == 'active':
+            self.zone_var = str(result['accountList'][int(id)]['rzone'])
+            self._account_id = str(result['accountList'][int(id)]['secAccountId'])
             return self._account_id
         else:
             return None
 
-    def get_account(self):
+    def set_account_id(self, account_id):
+        '''
+        set account id
+        '''
+        self._account_id = account_id
+
+    def get_account(self, v2=False):
         '''
         get important details of account, positions, portfolio stance...etc
         '''
-        headers = self.build_req_headers()
-        response = requests.get(self._urls.account(self._account_id), headers=headers, timeout=self.timeout)
+        headers = self.build_req_headers(include_trade_token=True)
+        url = self._urls.account(self._account_id)
+        if v2:
+            url = self._urls.account_summary(self._account_id)
+        response = requests.get(url, headers=headers, timeout=self.timeout)
         result = response.json()
         return result
 
-    def get_positions(self):
+    def get_positions(self, v2=False):
         '''
         output standing positions of stocks
         '''
-        data = self.get_account()
-        return data['positions']
+        data = self.get_account(v2)
+        if v2:
+            if data.get('assetSummaryVO', {}).get('positions') is not None:
+                return data['assetSummaryVO']['positions']
+        else:
+            if data.get('positions') is not None:
+                return data['positions']
+        return None
 
     def get_portfolio(self):
         '''
@@ -500,13 +523,21 @@ class webull :
         else:
             raise ValueError('Must provide a stock symbol or a stock id')
 
+        # Webull only supports fractionals < 1 full share
+        if quant < 1:
+            quant = float(quant)
+        elif quant % 1 == 0: # Check for 1.0, 2.0 float etc
+            quant  = int(quant)
+        elif isinstance(quant, float):
+            raise ValueError('Fractional shares must be less than 1')
+
         headers = self.build_req_headers(include_trade_token=True, include_time=True)
         data = {
             'action': action,
             'comboType': 'NORMAL',
             'orderType': orderType,
             'outsideRegularTradingHour': outsideRegularTradingHour,
-            'quantity': float(quant) if orderType == 'MKT' else int(quant),
+            'quantity': quant,
             'serialId': str(uuid.uuid4()),
             'tickerId': tId,
             'timeInForce': enforce
@@ -526,6 +557,14 @@ class webull :
             data['trailingStopStep'] = float(trial_value)
             data['trailingType'] = str(trial_type)
 
+        # Check if account can place order (PDT check, etc)
+        check_response = requests.post(self._urls.check_stock_order(self._account_id), json=data, headers=headers, timeout=self.timeout)
+        check_result = check_response.json()
+        if not check_result['forward']:
+            warning = check_result['checkResultList'][0]
+            raise Exception(f"{warning['code']}: {warning['msg']}")
+
+        # Place order
         response = requests.post(self._urls.place_orders(self._account_id), json=data, headers=headers, timeout=self.timeout)
         return response.json()
 
